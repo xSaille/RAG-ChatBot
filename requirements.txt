@@ -1,0 +1,8 @@
+gradio>=4.19.2
+ollama>=0.1.6
+typing-extensions>=4.10.0
+pypdf>=3.17.1
+sentence-transformers>=2.5.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+pytest>=7.4.0
