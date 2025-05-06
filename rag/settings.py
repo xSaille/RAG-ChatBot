@@ -12,6 +12,10 @@ class Settings:
     """
     # ... (rest of your existing docstring)
     """
+
+    GRADIO_SERVER_NAME: str = "127.0.0.1"
+    GRADIO_SHARE: bool = False
+    GRADIO_DEBUG: bool = True 
     
     OLLAMA_MODEL_NAME: str = 'qwen2.5:3b'
     
@@ -67,7 +71,6 @@ class Settings:
         path_obj = Path(filepath)
         if not path_obj.exists():
             try:
-                # Ensure parent directory exists
                 path_obj.parent.mkdir(parents=True, exist_ok=True)
                 with open(filepath, 'w', encoding='utf-8') as f:
                     json.dump(default_content, f, indent=2)

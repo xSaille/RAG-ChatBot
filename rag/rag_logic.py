@@ -14,8 +14,8 @@ Key Components:
 
 import json
 import ollama
-import numpy as np
-from typing import List, Dict, Tuple, Any
+import numpy as np # Ensure NumPy is imported
+from typing import List, Dict, Optional, Tuple, Any
 from llama_index.core import Settings as LlamaIndexSettings 
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from rag.settings import Settings as AppSettings
@@ -83,7 +83,7 @@ class RAGChatbot:
         """
         Load a previously processed document.
         """
-        if not filename or filename == "Select a document...":
+        if not filename or filename == "Select a document..." or filename is None: # Added None check
             logger.warning("Load document called with no or placeholder filename.")
             return "Please select a valid document"
             
@@ -347,24 +347,24 @@ class RAGChatbot:
             logger.error(f"Error retrieving chunks for file {self.processed_file_name}: {e}", exc_info=True)
             return []
 
-    def chat_interface_logic(self, message: str, history_from_gradio: List[Any], 
-                           state: Dict) -> Tuple[str, List[Dict[str,str]], Dict]:
+    def chat_interface_logic(self, message: str, history_from_gradio: List[Tuple[Optional[str], Optional[str]]], 
+                           state: Dict) -> Tuple[str, List[Tuple[Optional[str], Optional[str]]], Dict]:
         """
         Handle chat interface logic and response generation.
         
         Args:
             message: User's input message
-            history_from_gradio: Previous chat interactions from Gradio.
+            history_from_gradio: Previous chat interactions from Gradio (List[Tuple[str, str]])
             state: Current chat interface state (Dict)
             
         Returns:
             tuple:
                 - str: Empty string (Gradio requirement for some components)
-                - List[Dict[str,str]]: Updated chat history for Gradio Chatbot component
+                - List[Tuple[str, str]]: Updated chat history for Gradio Chatbot component
                 - Dict: Updated interface state
         """
         logger.info(f"Received message: '{message}'")
-        logger.debug(f"Input history_from_gradio: {history_from_gradio}")
+        logger.debug(f"Input history_from_gradio (expecting list of tuples): {history_from_gradio}")
 
         if not self.processed_data and state.get('processed_data'):
              logger.info("Restoring RAGChatbot's processed_data and processed_file_name from Gradio state.")
@@ -374,39 +374,21 @@ class RAGChatbot:
             logger.info(f"Gradio state file ('{state.get('processed_file_name')}') differs from RAG ('{self.processed_file_name}'). Syncing.")
             self.processed_data = state.get('processed_data', [])
             self.processed_file_name = state.get('processed_file_name')
-
-        internal_history_list_of_dicts: List[Dict[str, str]] = []
-        if history_from_gradio: 
-            for item in history_from_gradio:
-                if isinstance(item, tuple) and len(item) == 2:
-                    user_msg, assistant_msg = item
-                    if user_msg is not None:
-                        internal_history_list_of_dicts.append({"role": "user", "content": str(user_msg)})
-                    if assistant_msg is not None: 
-                        internal_history_list_of_dicts.append({"role": "assistant", "content": str(assistant_msg)})
-                elif isinstance(item, dict) and "role" in item and "content" in item:
-                    internal_history_list_of_dicts.append(item)
-                else:
-                    logger.warning(f"Skipping malformed history item from Gradio: {item}")
         
-        logger.debug(f"Internal history (list of dicts) for processing: {internal_history_list_of_dicts}")
+        current_gradio_history: List[Tuple[Optional[str], Optional[str]]] = list(history_from_gradio) if history_from_gradio else []
 
         if not self.processed_file_name or not self.processed_data:
             logger.warning("No document loaded or no processed data available. Prompting user.")
-            if message is not None:
-                 internal_history_list_of_dicts.append({"role": "user", "content": message})
-            internal_history_list_of_dicts.append({"role": "assistant", "content": "Please upload and process a PDF document first, or select an already processed one."})
-            return "", internal_history_list_of_dicts, state
+            updated_gradio_history = current_gradio_history + [(message, "Please upload and process a PDF document first, or select an already processed one.")]
+            return "", updated_gradio_history, state
 
         logger.info(f"Generating embedding for query: '{message}' using loaded document '{self.processed_file_name}'")
         query_embedding = self.embed_model.get_text_embedding(message)
 
         if query_embedding is None:
              logger.error("Failed to generate query embedding.")
-             if message is not None:
-                 internal_history_list_of_dicts.append({"role": "user", "content": message})
-             internal_history_list_of_dicts.append({"role": "assistant", "content": "Sorry, I couldn't process your query (embedding generation failed)."})
-             return "", internal_history_list_of_dicts, state
+             updated_gradio_history = current_gradio_history + [(message, "Sorry, I couldn't process your query (embedding generation failed).")]
+             return "", updated_gradio_history, state
         logger.info("Query embedding generated successfully.")
 
         relevant_chunks = self.retrieve_relevant_chunks(query_embedding)
@@ -430,9 +412,13 @@ class RAGChatbot:
         logger.debug(f"User prompt for Ollama (first 500 chars): {user_prompt_for_llm[:500]}...")
 
         ollama_messages = [{"role": "system", "content": system_message}]
-        history_limit_for_ollama = AppSettings.CHAT_HISTORY_LIMIT * 2
+        history_limit_for_ollama_turns = AppSettings.CHAT_HISTORY_LIMIT
         
-        ollama_messages.extend(internal_history_list_of_dicts[-history_limit_for_ollama:])
+        for user_msg, assistant_msg in current_gradio_history[-history_limit_for_ollama_turns:]:
+            if user_msg is not None:
+                ollama_messages.append({"role": "user", "content": str(user_msg)})
+            if assistant_msg is not None:
+                ollama_messages.append({"role": "assistant", "content": str(assistant_msg)})
         
         ollama_messages.append({"role": "user", "content": user_prompt_for_llm})
         logger.debug(f"Final messages for Ollama: {ollama_messages}")
@@ -450,18 +436,14 @@ class RAGChatbot:
             logger.error(f"Error generating answer with Ollama: {e}", exc_info=True)
             answer = "I encountered an error while trying to generate a response. Please try again."
 
-        if message is not None:
-            internal_history_list_of_dicts.append({"role": "user", "content": message})
-        internal_history_list_of_dicts.append({"role": "assistant", "content": answer})
-        
-        updated_history_for_gradio = internal_history_list_of_dicts
+        updated_gradio_history = current_gradio_history + [(message, answer)]
         
         state['processed_data'] = self.processed_data 
         state['processed_file_name'] = self.processed_file_name
         logger.debug(f"Updated Gradio state: processed_file_name='{self.processed_file_name}', processed_data_len={len(self.processed_data if self.processed_data else [])}")
-        logger.debug(f"Returning history for Gradio: {updated_history_for_gradio}")
+        logger.debug(f"Returning history for Gradio (list of tuples): {updated_gradio_history}")
 
-        return "", updated_history_for_gradio, state 
+        return "", updated_gradio_history, state 
 
     def get_initial_state(self) -> Dict:
         """
