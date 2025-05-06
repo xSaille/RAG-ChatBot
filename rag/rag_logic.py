@@ -1,170 +1,487 @@
-import gc
+"""
+RAG (Retrieval-Augmented Generation) Logic Module
+
+This module implements the core chatbot functionality, coordinating between
+document processing, vector storage, and response generation. It serves as
+the main orchestrator for the RAG system.
+
+Key Components:
+    - Document processing coordination
+    - Query embedding and retrieval
+    - Chat interface logic
+    - Response generation with context
+"""
+
+import json
 import ollama
 import numpy as np
-
-from typing import List, Dict, Optional, Tuple
-from sklearn.metrics.pairwise import cosine_similarity
-from rag.file_processor import PDFFileProcessor
-from rag.settings import Settings
+from typing import List, Dict, Tuple, Any
+from llama_index.core import Settings as LlamaIndexSettings 
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from rag.settings import Settings as AppSettings
 from rag.utils import logger
+from rag.document_store import DocumentStore
+from rag.db_manager import DBManager
+from rag.document_processor import DocumentProcessor
 
 class RAGChatbot:
-    def __init__(self, ollama_model_name: str = Settings.OLLAMA_MODEL_NAME, 
-                 embedding_model: str = Settings.EMBEDDING_MODEL_NAME):
+    """
+    Main RAG chatbot implementation.
+    
+    This class coordinates:
+    1. Document processing and storage
+    2. Query processing and retrieval
+    3. Chat interface management
+    4. Response generation
+    
+    Attributes:
+        embed_model: BGE-M3 embedding model
+        ollama_model_name: Name of the Ollama model for responses
+        doc_store: Document metadata manager
+        db_manager: ChromaDB interface
+        doc_processor: Document processing component
+        processed_data: Currently loaded document chunks
+        processed_file_name: Name of the active document
+        processed_files: Map of available documents
+    """
+    
+    def __init__(self, ollama_model_name: str = AppSettings.OLLAMA_MODEL_NAME):
         """
-        Initializes the RAG Chatbot using Ollama.
+        Initialize the RAG chatbot system.
+        
         Args:
-            ollama_model_name: The name of the model to use in Ollama
-            embedding_model: The SentenceTransformer model for embeddings
+            ollama_model_name: Name of the Ollama model to use (default: from settings)
         """
-        self.file_processor = PDFFileProcessor(model_name=embedding_model)
-        self.ollama_model_name = ollama_model_name
-        self.processed_data: List[Dict] = []
-        self.processed_file_name: Optional[str] = None
-        logger.info(f"RAGChatbot initialized. Using Ollama model: {self.ollama_model_name}")
         try:
-            ollama.list()
-            logger.info("Successfully connected to Ollama.")
+            self.embed_model = HuggingFaceEmbedding(
+                model_name="BAAI/bge-m3", 
+                embed_batch_size=1, 
+                trust_remote_code=True
+            )
+            LlamaIndexSettings.embed_model = self.embed_model
+            logger.info("Successfully initialized embedding model")
         except Exception as e:
-            logger.warning(f"Could not connect to Ollama. Ensure Ollama server is running. Error: {e}")
+            logger.error(f"Error initializing embedding model: {e}", exc_info=True)
+            raise
+        
+        self.ollama_model_name = ollama_model_name
+        self.doc_store = DocumentStore()
+        self.db_manager = DBManager()
+        self.doc_processor = DocumentProcessor(self.embed_model)
+        
+        self.processed_data = []
+        self.processed_file_name = None
+        self.processed_files = self.db_manager.processed_files
 
+    def get_available_documents(self) -> List[str]:
+        """
+        Get list of previously processed documents.
+        """
+        return list(self.processed_files.keys())
+
+    def load_document(self, filename: str) -> str:
+        """
+        Load a previously processed document.
+        """
+        if not filename or filename == "Select a document...":
+            logger.warning("Load document called with no or placeholder filename.")
+            return "Please select a valid document"
+            
+        if filename not in self.processed_files:
+            logger.warning(f"Attempted to load unprocessed document: {filename}")
+            return f"Document '{filename}' has not been processed yet"
+
+        collection_id = self.processed_files.get(filename)
+        if not collection_id:
+            logger.error(f"Collection ID not found for document: {filename} in processed_files map.")
+            return f"Internal error: Collection ID missing for '{filename}'. Please reprocess."
+
+        logger.info(f"Loading document '{filename}' with collection ID '{collection_id}'")
+        collection = self.db_manager.get_collection(collection_id)
+
+        if not collection:
+            logger.error(f"Could not retrieve collection '{collection_id}' for document '{filename}' from DBManager.")
+            return f"Document data not found for '{filename}'. It might have been deleted or an error occurred. Please process the document again."
+        
+        logger.debug(f"Fetching data with include: ['documents', 'embeddings', 'metadatas'] for '{filename}' (Collection ID: {collection_id})")
+        
+        try:
+            items = collection.get(include=['documents', 'embeddings', 'metadatas']) 
+            
+            if not items:
+                logger.error(f"Collection.get() returned empty items for {filename} (collection: {collection_id})")
+                return f"Document data is empty for '{filename}'. Please process the document again."
+
+            if 'ids' not in items or not items['ids']: 
+                 logger.warning(f"No items (IDs) found in collection {collection_id} for document {filename}. Returned items: {str(items)[:500]}...")
+                 self.processed_data = [] 
+                 self.processed_file_name = filename 
+                 return f"Warning: No data chunks found in '{filename}'. The document might be empty or processing yielded no chunks."
+
+            num_ids = len(items['ids'])
+            logger.info(f"Retrieved {num_ids} item IDs from collection {collection_id} for {filename}.")
+            logger.debug(f"Raw collection data for '{filename}' (first 500 chars): {str(items)[:500]}")
+
+            if 'embeddings' not in items or items['embeddings'] is None:
+                logger.error(f"Invalid or missing 'embeddings' key or None value in collection items for {filename} (collection: {collection_id}).")
+                logger.debug(f"Full items dictionary for {filename} (if embeddings missing): {items}")
+                return f"Document data for '{filename}' is corrupted (missing embeddings). Please process the document again."
+            
+            if not all(key in items for key in ['documents', 'metadatas']): 
+                missing_keys = [key for key in ['documents', 'metadatas'] if key not in items]
+                logger.error(f"Missing required data fields {missing_keys} in collection for {filename} (collection: {collection_id})")
+                return f"Document data for '{filename}' is incomplete. Please process the document again."
+                
+            try:
+                self.processed_data = []
+                
+                if not (len(items.get('documents', [])) == num_ids and \
+                        len(items.get('embeddings', [])) == num_ids and \
+                        len(items.get('metadatas', [])) == num_ids):
+                    logger.error(f"Data inconsistency in collection {collection_id} for {filename}: "
+                                 f"IDs ({num_ids}), "
+                                 f"Docs ({len(items.get('documents', []))}), " 
+                                 f"Embeds ({len(items.get('embeddings', []))}), "
+                                 f"Metas ({len(items.get('metadatas', []))}).")
+                    return f"Data inconsistency found in '{filename}'. Please reprocess."
+
+                for i in range(num_ids):
+                    current_embedding_original = items['embeddings'][i]
+                    
+                    if current_embedding_original is None:
+                        logger.warning(f"Individual embedding for item ID {items['ids'][i]} (index {i}) in document {filename} is None. Skipping this item.")
+                        continue 
+                    
+                    processed_embedding = None
+                    if isinstance(current_embedding_original, list):
+                        processed_embedding = current_embedding_original
+                    elif isinstance(current_embedding_original, np.ndarray):
+                        logger.debug(f"Embedding for item ID {items['ids'][i]} (index {i}) is numpy.ndarray, converting to list.")
+                        processed_embedding = current_embedding_original.tolist()
+                    else:
+                        logger.warning(f"Individual embedding for item ID {items['ids'][i]} (index {i}) in document {filename} is not a list or numpy.ndarray (type: {type(current_embedding_original)}). Skipping this item.")
+                        continue
+
+                    current_metadata_item = items['metadatas'][i]
+                    if not isinstance(current_metadata_item, dict) or 'metadata' not in current_metadata_item:
+                        logger.warning(f"Metadata for item ID {items['ids'][i]} (index {i}) in document {filename} is not a dict or missing 'metadata' key. Item: {current_metadata_item}. Skipping this item.")
+                        continue
+                    
+                    try:
+                        parsed_metadata = json.loads(current_metadata_item['metadata'])
+                    except json.JSONDecodeError as je:
+                        logger.warning(f"JSONDecodeError for metadata of item ID {items['ids'][i]} (index {i}) in document {filename}. Error: {je}. Metadata string: '{current_metadata_item['metadata']}'. Skipping this item.")
+                        continue
+
+                    self.processed_data.append({
+                        'content': items['documents'][i],
+                        'embedding': processed_embedding,
+                        'metadata': parsed_metadata 
+                    })
+                
+                if not self.processed_data and num_ids > 0 : 
+                    logger.error(f"All {num_ids} items for document {filename} had corrupt embeddings or other processing issues after type conversion. No data loaded.")
+                    return f"All data chunks for '{filename}' have corrupt embeddings or processing issues. Please reprocess the document."
+
+            except (IndexError, KeyError, TypeError, json.JSONDecodeError) as e: 
+                logger.error(f"Error parsing or structuring collection data for {filename} (collection: {collection_id}): {e}", exc_info=True)
+                return f"Error parsing document data for '{filename}'. Please process the document again."
+            
+            self.processed_file_name = filename
+            logger.info(f"Successfully loaded {len(self.processed_data)} chunks from {filename}")
+            return f"Loaded {len(self.processed_data)} chunks from {filename}"
+            
+        except ValueError as ve: 
+            logger.error(f"ValueError during collection.get for {filename} (collection: {collection_id}): {ve}", exc_info=True)
+            return f"Error retrieving data for '{filename}' due to invalid parameters. {ve}"
+        except Exception as e:
+            logger.error(f"Unexpected error loading document {filename} (collection: {collection_id}): {e}", exc_info=True)
+            return f"Error loading document '{filename}'. Please try again."
 
     def process_uploaded_file(self, file_obj) -> str:
-        """ Processes the uploaded PDF file. """
-        if file_obj is None:
-            return "No file uploaded. Please upload a PDF."
-        print(f"Received file: {file_obj.name}")
-        self.processed_file_name = file_obj.name
-        self.processed_data = []
-        gc.collect()
+        """
+        Process an uploaded PDF file.
+        """
+        if not file_obj or not hasattr(file_obj, 'name') or not file_obj.name.lower().endswith('.pdf'):
+            logger.warning("Invalid file uploaded or not a PDF.")
+            return "Please upload a valid PDF file."
         
-        self.processed_data = self.file_processor.process_document(file_obj.name)
+        original_filename_for_logging = getattr(file_obj, 'orig_name', file_obj.name)
+        logger.info(f"Starting processing for uploaded file: {original_filename_for_logging}")
 
-        if not self.processed_data:
-             self.processed_file_name = None
-             return f"Failed to process {file_obj.name}. Check logs."
-        num_chunks = len(self.processed_data)
-        return f"Successfully processed '{self.processed_file_name}' into {num_chunks} chunks."
-
-    def embed_query(self, query: str) -> Optional[np.ndarray]:
-        """ Embeds the user query. """
-        if not query: return None
         try:
-            query_embedding = self.file_processor.model.encode(
-                [query], normalize_embeddings=True, show_progress_bar=False
+            filename, collection_id, embeddings_data = self.doc_processor.process_document(file_obj) 
+            
+            if not filename or not collection_id:
+                logger.error(f"Document processing failed for {original_filename_for_logging}. Received: filename={filename}, collection_id={collection_id}, has_embeddings_data={bool(embeddings_data)}")
+                return "Error processing document. Document processor returned insufficient data (filename/collection_id)."
+            
+            if embeddings_data is None:
+                logger.error(f"Document processing for {filename} returned None for embeddings_data.")
+                return "Error processing document: No embedding data returned."
+
+            logger.info(f"Document processor returned {len(embeddings_data)} items for {filename}.")
+            logger.debug(f"Raw embeddings_data from doc_processor for {filename} (first 500 chars): {str(embeddings_data)[:500]}...")
+
+            if not isinstance(embeddings_data, list) or not all(isinstance(item, dict) for item in embeddings_data):
+                logger.error(f"Embeddings data for {filename} is not a list of dictionaries as expected.")
+                return "Error: Document processing failed - invalid data structure from processor."
+
+            embeddings_for_chroma = []
+            valid_embeddings_data_for_state = []
+            documents_for_chroma = []
+            metadatas_for_chroma = []
+            ids_for_chroma = []
+
+            for i, item in enumerate(embeddings_data):
+                if 'embedding' not in item or item['embedding'] is None:
+                    logger.warning(f"Item {i} for {filename} has missing or None embedding. Skipping. Content: {item.get('content', 'N/A')[:50]}...")
+                    continue
+                if not isinstance(item['embedding'], list) or not all(isinstance(x, (float, int)) for x in item['embedding']):
+                    logger.warning(f"Item {i} for {filename} has an invalid embedding format. Skipping. Type: {type(item['embedding'])}. Content: {item.get('content', 'N/A')[:50]}...")
+                    continue
+                if 'content' not in item or 'metadata' not in item:
+                    logger.warning(f"Item {i} for {filename} is missing 'content' or 'metadata'. Skipping. Item: {item}")
+                    continue
+
+                embeddings_for_chroma.append(item['embedding'])
+                documents_for_chroma.append(item['content'])
+                metadatas_for_chroma.append({'metadata': json.dumps(item['metadata'])})
+                ids_for_chroma.append(str(i)) 
+                valid_embeddings_data_for_state.append(item)
+            
+            if not valid_embeddings_data_for_state:
+                logger.warning(f"No valid embeddings/chunks found for {filename} after filtering. Original: {len(embeddings_data)}.")
+                self.processed_file_name = filename
+                self.processed_data = []
+                self.processed_files[filename] = collection_id
+                self.db_manager._save_processed_files()
+                self.doc_store.add_document(filename, collection_id, {'num_chunks': 0, 'original_num_chunks_processed': len(embeddings_data)})
+                return f"Successfully processed {filename}: 0 valid chunks found."
+
+            logger.info(f"Proceeding with {len(valid_embeddings_data_for_state)} valid chunks for {filename}.")
+
+            if filename in self.processed_files:
+                old_collection_id = self.processed_files[filename]
+                if old_collection_id != collection_id:
+                     logger.info(f"Content for {filename} changed (new ID {collection_id}, old {old_collection_id}). Deleting old collection.")
+                     self.db_manager.delete_collection(old_collection_id)
+                else:
+                    logger.info(f"Re-processing {filename} (ID {collection_id}). Clearing old data.")
+                    self.db_manager.delete_collection(collection_id)
+            
+            self.processed_file_name = filename
+            self.processed_data = valid_embeddings_data_for_state
+            
+            logger.info(f"Creating/getting collection '{collection_id}' for {filename}")
+            collection = self.db_manager.create_collection(
+                collection_id,
+                metadata={"source": filename}
             )
-            return query_embedding[0]
-        except Exception as e:
-            print(f"Error embedding query: {e}")
-            return None
-
-    def retrieve_relevant_chunks(self, query_embedding: np.ndarray, 
-                               top_k: int = Settings.RETRIEVAL_TOP_K) -> List[str]:
-        """ Retrieves top_k relevant chunk texts based on cosine similarity. """
-        if query_embedding is None or not self.processed_data:
-            logger.warning("No query embedding or processed data available")
-            return []
-        
-        chunk_embeddings = np.array([chunk['embedding'] for chunk in self.processed_data 
-                                   if chunk.get('embedding') is not None])
-        if chunk_embeddings.shape[0] == 0:
-            logger.warning("No chunk embeddings available for retrieval.")
-            return []
-
-        similarities = cosine_similarity(query_embedding.reshape(1, -1), chunk_embeddings)[0]
-        k = min(top_k, len(similarities))
-        if k == 0: return []
-        
-        top_k_indices = np.argsort(similarities)[-k:][::-1]
-        relevant_chunk_texts = [self.processed_data[i]['content'] for i in top_k_indices]
-        logger.info(f"Retrieved {len(relevant_chunk_texts)} relevant chunks.")
-        return relevant_chunk_texts
-
-    def generate_answer_with_ollama(self, query: str, context_chunks: List[str], 
-                                  history: List[Tuple[str, str]]) -> str:
-        """ Generates answer using Ollama with context. """
-        if not query: return "Please provide a query."
-
-        try:
-            with open('rag/prompt.txt', 'r') as f:
-                system_message = f.read()
-        except Exception as e:
-            logger.error(f"Could not read prompt.txt: {e}")
-            system_message = "You are a helpful AI assistant analyzing documents and answering questions."
-
-        if context_chunks:
-            context = "\n\n---\n\n".join(context_chunks)
-            user_prompt_content = f"User Query: {query}\n\nPotentially Relevant Context Snippets:\n{context}"
-        else:
-            user_prompt_content = query
-            logger.warning("No relevant chunks found for this query. Answering generally.")
-
-        messages = [{"role": "system", "content": system_message}]
-        limited_history = history[-(Settings.CHAT_HISTORY_LIMIT*2):] if history else []
-        for turn in limited_history:
-            if turn[0]: messages.append({"role": "user", "content": turn[0]})
-            if turn[1] and len(messages) < (Settings.CHAT_HISTORY_LIMIT * 2 + 1):
-                 messages.append({"role": "assistant", "content": turn[1]})
-        
-        messages.append({"role": "user", "content": user_prompt_content})
-
-        logger.info(f"Calling Ollama ({self.ollama_model_name})")
-
-        try:
-            response = ollama.chat(
-                model=self.ollama_model_name,
-                messages=messages,
-                options=Settings.GENERATION_CONFIG
+            if not collection:
+                 logger.error(f"Failed to create or get collection '{collection_id}' for {filename}")
+                 return f"Error: Could not create database collection for {filename}."
+            
+            logger.info(f"Adding {len(ids_for_chroma)} chunks to collection '{collection_id}' for {filename}.")
+            
+            collection.add(
+                ids=ids_for_chroma,
+                documents=documents_for_chroma,
+                embeddings=embeddings_for_chroma, 
+                metadatas=metadatas_for_chroma
             )
-            answer = response['message']['content']
-            logger.info(f"Received response from Ollama: {len(answer)} chars")
-            return answer.strip()
+            logger.info(f"Successfully added {len(ids_for_chroma)} items to collection '{collection_id}' for {filename}.")
+            
+            self.processed_files[filename] = collection_id
+            self.db_manager._save_processed_files() 
+            
+            self.doc_store.add_document(filename, collection_id, {
+                'num_chunks': len(valid_embeddings_data_for_state),
+                'original_num_chunks_processed': len(embeddings_data)
+            })
+            
+            return f"Successfully processed {len(valid_embeddings_data_for_state)} chunks from {filename}"
 
         except Exception as e:
-            logger.error(f"Error during Ollama API call: {e}")
-            gc.collect()
-            return f"Sorry, an error occurred while contacting the AI model: {e}"
+            logger.error(f"Error processing file {original_filename_for_logging}: {e}", exc_info=True)
+            self.processed_data = []
+            self.processed_file_name = None
+            return f"Error processing file '{original_filename_for_logging}': {str(e)}"
+
+    def retrieve_relevant_chunks(self, query_embedding: np.ndarray) -> List[str]:
+        """
+        Retrieve relevant chunks for a query.
+        """
+        if query_embedding is None :
+            logger.warning("Query embedding is None, cannot retrieve chunks.")
+            return []
+        if not self.processed_file_name:
+            logger.warning("No document processed or loaded, cannot retrieve chunks.")
+            return []
+            
+        try:
+            collection_id = self.processed_files.get(self.processed_file_name)
+            if not collection_id:
+                logger.error(f"Cannot retrieve chunks. No collection ID for file: {self.processed_file_name}")
+                return []
+
+            collection = self.db_manager.get_collection(collection_id)
+            if not collection:
+                logger.error(f"Cannot retrieve chunks. Collection {collection_id} not found for file: {self.processed_file_name}")
+                return []
+
+            logger.info(f"Querying collection {collection_id} for top {AppSettings.RETRIEVAL_TOP_K} results.")
+            query_embedding_list = query_embedding.tolist() if isinstance(query_embedding, np.ndarray) else query_embedding
+            
+            results = collection.query(
+                query_embeddings=[query_embedding_list], 
+                n_results=AppSettings.RETRIEVAL_TOP_K,
+                include=['documents'] 
+            )
+            
+            retrieved_docs = results['documents'][0] if results and 'documents' in results and results['documents'] else []
+            logger.info(f"Retrieved {len(retrieved_docs)} chunks for the query.")
+            return retrieved_docs
+            
+        except Exception as e:
+            logger.error(f"Error retrieving chunks for file {self.processed_file_name}: {e}", exc_info=True)
+            return []
+
+    def chat_interface_logic(self, message: str, history_from_gradio: List[Any], 
+                           state: Dict) -> Tuple[str, List[Dict[str,str]], Dict]:
+        """
+        Handle chat interface logic and response generation.
         
-    def chat_interface_logic(self, message: str, history: List[Tuple[str, str]], state: Dict) -> Tuple[str, List[Tuple[str, str]], Dict]:
-        """ Handles the main RAG chat interaction flow. """
-        
+        Args:
+            message: User's input message
+            history_from_gradio: Previous chat interactions from Gradio.
+            state: Current chat interface state (Dict)
+            
+        Returns:
+            tuple:
+                - str: Empty string (Gradio requirement for some components)
+                - List[Dict[str,str]]: Updated chat history for Gradio Chatbot component
+                - Dict: Updated interface state
+        """
+        logger.info(f"Received message: '{message}'")
+        logger.debug(f"Input history_from_gradio: {history_from_gradio}")
+
         if not self.processed_data and state.get('processed_data'):
+             logger.info("Restoring RAGChatbot's processed_data and processed_file_name from Gradio state.")
              self.processed_data = state.get('processed_data', [])
              self.processed_file_name = state.get('processed_file_name')
-             print(f"Restored state: {len(self.processed_data)} chunks for file {self.processed_file_name}")
+        elif self.processed_file_name != state.get('processed_file_name') and state.get('processed_file_name'):
+            logger.info(f"Gradio state file ('{state.get('processed_file_name')}') differs from RAG ('{self.processed_file_name}'). Syncing.")
+            self.processed_data = state.get('processed_data', [])
+            self.processed_file_name = state.get('processed_file_name')
 
-        if not self.processed_data:
-            history.append((message, "Please upload and process a PDF document first."))
-            return "", history, state
+        internal_history_list_of_dicts: List[Dict[str, str]] = []
+        if history_from_gradio: 
+            for item in history_from_gradio:
+                if isinstance(item, tuple) and len(item) == 2:
+                    user_msg, assistant_msg = item
+                    if user_msg is not None:
+                        internal_history_list_of_dicts.append({"role": "user", "content": str(user_msg)})
+                    if assistant_msg is not None: 
+                        internal_history_list_of_dicts.append({"role": "assistant", "content": str(assistant_msg)})
+                elif isinstance(item, dict) and "role" in item and "content" in item:
+                    internal_history_list_of_dicts.append(item)
+                else:
+                    logger.warning(f"Skipping malformed history item from Gradio: {item}")
+        
+        logger.debug(f"Internal history (list of dicts) for processing: {internal_history_list_of_dicts}")
 
-        print(f"\nUser Query: {message}")
+        if not self.processed_file_name or not self.processed_data:
+            logger.warning("No document loaded or no processed data available. Prompting user.")
+            if message is not None:
+                 internal_history_list_of_dicts.append({"role": "user", "content": message})
+            internal_history_list_of_dicts.append({"role": "assistant", "content": "Please upload and process a PDF document first, or select an already processed one."})
+            return "", internal_history_list_of_dicts, state
 
-        retrieval_k = 5
-        print(f"Retrieving top {retrieval_k} chunks.")
+        logger.info(f"Generating embedding for query: '{message}' using loaded document '{self.processed_file_name}'")
+        query_embedding = self.embed_model.get_text_embedding(message)
 
-        query_embedding = self.embed_query(message)
         if query_embedding is None:
-             history.append((message, "Sorry, I couldn't process your query embedding."))
-             return "", history, state
+             logger.error("Failed to generate query embedding.")
+             if message is not None:
+                 internal_history_list_of_dicts.append({"role": "user", "content": message})
+             internal_history_list_of_dicts.append({"role": "assistant", "content": "Sorry, I couldn't process your query (embedding generation failed)."})
+             return "", internal_history_list_of_dicts, state
+        logger.info("Query embedding generated successfully.")
 
-        relevant_chunks = self.retrieve_relevant_chunks(query_embedding, top_k=retrieval_k)
+        relevant_chunks = self.retrieve_relevant_chunks(query_embedding)
+        logger.info(f"Retrieved {len(relevant_chunks)} relevant chunks.")
+        if not relevant_chunks:
+            logger.warning("No relevant chunks found for the query.")
 
-        answer = self.generate_answer_with_ollama(message, relevant_chunks, history) 
+        try:
+            with open(AppSettings.PROMPT_FILE_PATH, 'r', encoding='utf-8') as f: 
+                system_message = f.read()
+            logger.debug("Loaded system prompt successfully.")
+        except FileNotFoundError:
+            logger.error(f"Prompt file not found at {AppSettings.PROMPT_FILE_PATH}. Using default system message.")
+            system_message = "You are a helpful AI assistant analyzing documents."
+        except Exception as e:
+            logger.error(f"Error reading prompt file: {e}. Using default system message.", exc_info=True)
+            system_message = "You are a helpful AI assistant analyzing documents."
 
-        history.append((message, answer))
+        context = "\n\n---\n\n".join(relevant_chunks) if relevant_chunks else "No specific context found for this query in the document."
+        user_prompt_for_llm = f"User Query: {message}\n\nPotentially Relevant Context Snippets:\n{context}"
+        logger.debug(f"User prompt for Ollama (first 500 chars): {user_prompt_for_llm[:500]}...")
 
-        state['processed_data'] = self.processed_data
+        ollama_messages = [{"role": "system", "content": system_message}]
+        history_limit_for_ollama = AppSettings.CHAT_HISTORY_LIMIT * 2
+        
+        ollama_messages.extend(internal_history_list_of_dicts[-history_limit_for_ollama:])
+        
+        ollama_messages.append({"role": "user", "content": user_prompt_for_llm})
+        logger.debug(f"Final messages for Ollama: {ollama_messages}")
+
+        try:
+            logger.info(f"Sending request to Ollama model: {self.ollama_model_name}")
+            response = ollama.chat(
+                model=self.ollama_model_name,
+                messages=ollama_messages,
+                options=AppSettings.GENERATION_CONFIG
+            )
+            answer = response['message']['content'].strip()
+            logger.info(f"Received answer from Ollama (first 100 chars): {answer[:100]}...")
+        except Exception as e:
+            logger.error(f"Error generating answer with Ollama: {e}", exc_info=True)
+            answer = "I encountered an error while trying to generate a response. Please try again."
+
+        if message is not None:
+            internal_history_list_of_dicts.append({"role": "user", "content": message})
+        internal_history_list_of_dicts.append({"role": "assistant", "content": answer})
+        
+        updated_history_for_gradio = internal_history_list_of_dicts
+        
+        state['processed_data'] = self.processed_data 
         state['processed_file_name'] = self.processed_file_name
+        logger.debug(f"Updated Gradio state: processed_file_name='{self.processed_file_name}', processed_data_len={len(self.processed_data if self.processed_data else [])}")
+        logger.debug(f"Returning history for Gradio: {updated_history_for_gradio}")
 
-        return "", history, state 
+        return "", updated_history_for_gradio, state 
 
     def get_initial_state(self) -> Dict:
-        """ Returns the initial state for Gradio. """
+        """
+        Get initial state for the chat interface.
+        """
+        logger.debug("Getting initial Gradio state for RAGChatbot.")
         return {'processed_data': [], 'processed_file_name': None}
+
+    def update_state_after_upload_or_load(self, status: str, state: Dict) -> Dict:
+        """
+        Update Gradio interface state after document upload or load.
+        """
+        logger.info(f"Attempting to update Gradio state. Status: '{status}'")
+        if self.processed_file_name and ("Successfully processed" in status or "Loaded" in status and "chunks from" in status):
+            updated_state = {
+                'processed_data': self.processed_data,
+                'processed_file_name': self.processed_file_name
+            }
+            logger.info(f"Gradio state updated: file='{self.processed_file_name}', data_len={len(self.processed_data if self.processed_data else [])}")
+            return updated_state
         
-    def update_state_after_upload(self, status_message: str, state: Dict) -> Dict:
-        """ Updates the Gradio state after file processing. """
-        state['processed_data'] = self.processed_data
-        state['processed_file_name'] = self.processed_file_name
-        print(f"Updating state: {len(state.get('processed_data',[]))} chunks processed for file {state.get('processed_file_name')}")
+        logger.info("Gradio state not updated based on RAGChatbot state or status message.")
         return state

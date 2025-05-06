@@ -1,8 +1,22 @@
+"""
+RAG PDF Chatbot Web Interface
+
+This is the main entry point for the RAG PDF Chatbot application. It sets up
+a Gradio-based web interface that allows users to:
+1. Upload and process PDF documents
+2. Chat with an AI about the document's contents
+3. View processing status and chat history
+
+The interface is designed to be user-friendly and responsive, with proper
+error handling and state management.
+"""
+
 import gradio as gr
 from rag.rag_logic import RAGChatbot
 from rag.settings import Settings
 from rag.utils import logger
 
+# Initialize the RAG chatbot system
 try:
     rag_chatbot = RAGChatbot()
 except Exception as e:
@@ -10,9 +24,17 @@ except Exception as e:
     raise SystemExit(f"Error initializing chatbot: {e}")
 
 def validate_input(prompt: str) -> dict:
-    """Enable send button only if there is non-whitespace input."""
+    """Validate user input and control send button state.
+    
+    Args:
+        prompt (str): User's input text
+        
+    Returns:
+        dict: Gradio update object for send button interactivity
+    """
     return gr.update(interactive=bool(prompt and prompt.strip()))
 
+# Custom CSS for better UI appearance
 CSS = """
 #component-0 { height: 100vh !important; max-width: 100vw !important; padding: 0 !important; margin: 0 !important; }
 .gradio-container { height: 100vh !important; }
@@ -21,10 +43,13 @@ CSS = """
 #input-box textarea { padding: 10px !important; }
 """
 
+# Build the Gradio interface
 with gr.Blocks(css=CSS, theme=gr.themes.Soft(), title="RAG PDF Chatbot") as app:
+    # Initialize application state
     app_state = gr.State(value=rag_chatbot.get_initial_state()) 
 
     with gr.Row(elem_classes="container"):
+        # Document Processing Section
         with gr.Column(scale=1):
             gr.Markdown("## Document Processing")
             file_input = gr.File(
@@ -50,6 +75,7 @@ with gr.Blocks(css=CSS, theme=gr.themes.Soft(), title="RAG PDF Chatbot") as app:
                 scale=1
             )
 
+        # Chat Interface Section
         with gr.Column(scale=3):
             gr.Markdown("# AI Chat Assistant")
             chatbot_ui = gr.Chatbot(
@@ -82,7 +108,7 @@ with gr.Blocks(css=CSS, theme=gr.themes.Soft(), title="RAG PDF Chatbot") as app:
                     scale=1
                 )
 
-    # Event handlers
+    # Event Handler Configuration
     textbox.input(
         validate_input,
         inputs=[textbox],
@@ -108,7 +134,6 @@ with gr.Blocks(css=CSS, theme=gr.themes.Soft(), title="RAG PDF Chatbot") as app:
         inputs=[textbox, chatbot_ui, app_state],
         outputs=[textbox, chatbot_ui, app_state]
     )
-    
     textbox.submit(
         fn=rag_chatbot.chat_interface_logic,
         inputs=[textbox, chatbot_ui, app_state],
